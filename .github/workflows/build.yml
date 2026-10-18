@@ -22,11 +22,14 @@ jobs:
           channel: stable
       - name: Generate Android scaffold
         run: flutter create . --platforms=android --org app.whisprspace --project-name whisprspace
-      - name: Permissions and app name
+      - name: Permissions, app name, min SDK
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<application|<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <application|' $M
+          for p in RECORD_AUDIO INTERNET MODIFY_AUDIO_SETTINGS ACCESS_NETWORK_STATE ACCESS_COARSE_LOCATION; do
+            sed -i "s|<application|<uses-permission android:name=\"android.permission.$p\"/><application|" $M
+          done
           sed -i 's|android:label="[^"]*"|android:label="WhisprSpace"|' $M
+          sed -i -E 's/minSdk(Version)?( =)? flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
       - run: flutter pub get
       - run: dart run flutter_launcher_icons
       - run: flutter build apk --release
