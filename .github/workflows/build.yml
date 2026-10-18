@@ -8,6 +8,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Unpack project
+        run: |
+          unzip -q whisprspace.zip
+          cp -r whisprspace/. .
+          rm -rf whisprspace
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
