@@ -30,6 +30,17 @@ jobs:
           done
           sed -i 's|android:label="[^"]*"|android:label="WhisprSpace"|' $M
           sed -i -E 's/minSdk(Version)?( =)? flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
+      - name: Fetch NASA Blue Marble (public domain)
+        run: |
+          mkdir -p assets
+          for u in \
+            "https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg" \
+            "http://veimages.gsfc.nasa.gov/2433/land_shallow_topo_2048.jpg" \
+            "https://commons.wikimedia.org/wiki/Special:FilePath/Land_shallow_topo_2048.jpg"; do
+            if curl -fsSL --retry 2 -A "Mozilla/5.0" "$u" -o assets/earth.jpg && [ "$(stat -c%s assets/earth.jpg)" -gt 100000 ]; then break; fi
+            rm -f assets/earth.jpg
+          done
+          test -f assets/earth.jpg || { echo "Could not download the Earth texture"; exit 1; }
       - run: flutter pub get
       - run: dart run flutter_launcher_icons
       - run: flutter build apk --release
