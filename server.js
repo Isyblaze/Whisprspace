@@ -1,4 +1,4 @@
-// WhisprSpace matchmaker + signaling relay + safety.
+// WhisprSpace matchmaker + signaling relay + safety + anonymous world heat.
 // Privacy: in-memory only. No database, no logs, no IP storage (IPs are only counted live).
 const http = require('http');
 const crypto = require('crypto');
@@ -7,6 +7,7 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH !== 'false';
 const MAX_CONN_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || '8', 10);
+const HEAT_MIN = parseInt(process.env.HEAT_MIN || '5', 10); // a 2-degree cell only shows once this many are active
 
 const ice = [{ urls: process.env.STUN_URL || 'stun:stun.l.google.com:19302' }];
 let relay = false;
@@ -16,20 +17,14 @@ if (process.env.TURN_URL) {
 }
 
 // ---- safety policy ----
-const WINDOW = 24 * 3600e3;                    // strikes count for 24h
-const THRESH = 3;                              // weighted distinct reporters needed
+const WINDOW = 24 * 3600e3, THRESH = 3;
 const WEIGHT = { 'Underage voice': 2, 'Sexual content': 2, 'Hate or threats': 2 };
 const BAN_STEPS = [2 * 3600e3, 24 * 3600e3, 7 * 24 * 3600e3, 30 * 24 * 3600e3];
-const BLOCK_TTL = 6 * 3600e3;                  // "block for this session" lasts 6h
+const BLOCK_TTL = 6 * 3600e3;
 const FIND_PER_MIN = 10, MSGS_PER_10S = 150;
 
-const bans = new Map();      // id -> until
-const banCount = new Map();  // id -> { n, exp }
-const strikes = new Map();   // target -> [{ by, w, ts }]
-const blocks = new Map();    // id -> Map(blockedId -> exp)
-const reported = new Map();  // "by>target" -> ts
-const findLog = new Map();   // id -> [ts]
-const ipConns = new Map();   // ip -> live count (never persisted)
+const bans = new Map(), banCount = new Map(), strikes = new Map(), blocks = new Map();
+const reported = new Map(), findLog = new Map(), ipConns = new Map();
 
 const SPKI = Buffer.from('302a300506032b6570032100', 'hex');
 function identify(pubB64, nonce, sigB64) {
@@ -44,20 +39,38 @@ function identify(pubB64, nonce, sigB64) {
   } catch { return null; }
 }
 
+// ---- geography: everything is coarse (2-degree cells, ~220 km) ----
+function cellCenter(key) {
+  const m = /^(\d{1,3}):(\d{1,2})$/.exec(String(key || ''));
+  if (!m) return null;
+  const ix = +m[1], iy = +m[2];
+  if (ix > 179 || iy > 89) return null;
+  return { lon: -180 + (ix + 0.5) * 2, lat: -90 + (iy + 0.5) * 2 };
+}
+function km(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dl = (b.lat - a.lat) * rad, dn = (b.lon - a.lon) * rad;
+  const h = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dn / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+const inArea = (area, home) => !area || (!!home && km(area, home) <= area.r);
+function parseArea(a) {
+  if (!a || typeof a !== 'object') return null;
+  let lat = +a.lat, lon = +a.lon, r = +a.r;
+  if (![lat, lon, r].every(Number.isFinite) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  r = Math.min(1500, Math.max(300, r)); // never smaller than ~300 km, so nobody can target a neighbourhood
+  const c = cellCenter(`${Math.min(179, Math.floor((lon + 180) / 2))}:${Math.min(89, Math.floor((lat + 90) / 2))}`);
+  return c ? { lat: c.lat, lon: c.lon, r } : null;
+}
+
 const server = http.createServer((_, res) => { res.writeHead(200); res.end('ok'); });
 const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 });
-const queues = new Map();
+const waiting = new Set();
 const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
 function isBlocked(a, b) { const m = blocks.get(a); const e = m && m.get(b); return !!e && e > Date.now(); }
 function addBlock(a, b) { if (!a || !b) return; let m = blocks.get(a); if (!m) { m = new Map(); blocks.set(a, m); } m.set(b, Date.now() + BLOCK_TTL); }
-
-function dequeue(ws) {
-  if (!ws.key) return;
-  const q = queues.get(ws.key);
-  if (q) { q.delete(ws); if (!q.size) queues.delete(ws.key); }
-  ws.key = null; clearTimeout(ws.timer);
-}
+function dequeue(ws) { if (!ws.waiting) return; waiting.delete(ws); ws.waiting = false; clearTimeout(ws.timer); }
 function unpair(ws) {
   const p = ws.peer; if (!p) return;
   const t = Date.now();
@@ -69,9 +82,7 @@ function peerTarget(ws) {
   return ws.lastPeerId && Date.now() - ws.lastPeerAt < 120000 ? ws.lastPeerId : null;
 }
 function kick(id) {
-  wss.clients.forEach((c) => {
-    if (c.id === id) { send(c, { t: 'banned', until: bans.get(id) }); dequeue(c); unpair(c); setTimeout(() => c.close(), 200); }
-  });
+  wss.clients.forEach((c) => { if (c.id === id) { send(c, { t: 'banned', until: bans.get(id) }); dequeue(c); unpair(c); setTimeout(() => c.close(), 200); } });
 }
 function handleReport(ws, reason) {
   const target = peerTarget(ws); if (!target || target === ws.id) return;
@@ -91,6 +102,36 @@ function handleReport(ws, reason) {
     strikes.delete(target); kick(target);
   }
 }
+
+// both people must be happy with each other's region, and mood must fit
+function compatible(a, b) {
+  if (a.id === b.id || isBlocked(a.id, b.id) || isBlocked(b.id, a.id)) return false;
+  if (a.mood && b.mood && a.mood !== b.mood) return false;
+  return inArea(a.area, b.home) && inArea(b.area, a.home);
+}
+
+// anonymous world heat: only cells with >= HEAT_MIN active people, with +/-1 noise on the counts
+function sendHeat() {
+  const cells = new Map(); let total = 0;
+  wss.clients.forEach((c) => {
+    const active = c.waiting || c.peer; if (!active) return;
+    total++;
+    if (!c.homeKey) return;
+    const e = cells.get(c.homeKey) || { l: 0, t: 0 };
+    if (c.peer) e.t++; else e.l++;
+    cells.set(c.homeKey, e);
+  });
+  const jit = () => Math.floor(Math.random() * 3) - 1, out = [];
+  for (const [k, e] of cells) {
+    if (e.l + e.t < HEAT_MIN) continue;
+    const [ix, iy] = k.split(':').map(Number);
+    out.push([ix, iy, Math.max(0, e.l + jit()), Math.max(0, e.t + jit())]);
+    if (out.length >= 400) break;
+  }
+  const msg = { t: 'heat', cells: out, total: total >= HEAT_MIN ? total : 0 };
+  wss.clients.forEach((c) => { if (c.watch) send(c, msg); });
+}
+if (process.env.WHISPR_TEST) global.__whisprHeat = sendHeat;
 
 wss.on('connection', (ws, req) => {
   const ip = (req.headers && req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim() : '') || (req.socket && req.socket.remoteAddress) || 'x';
@@ -121,29 +162,28 @@ wss.on('connection', (ws, req) => {
     }
     if (!ws.id) return;
 
-    if (m.t === 'find') {
+    if (m.t === 'watch') { ws.watch = !!m.on; if (ws.watch) sendHeat(); }
+    else if (m.t === 'find') {
       const log = (findLog.get(ws.id) || []).filter((x) => now - x < 60000);
       if (log.length >= FIND_PER_MIN) return send(ws, { t: 'ratelimit' });
       log.push(now); findLog.set(ws.id, log);
       dequeue(ws); unpair(ws);
-      const scope = m.scope === 'nearby' ? 'nearby' : 'global';
-      const cell = scope === 'nearby' && typeof m.cell === 'string' ? m.cell.slice(0, 32) : '';
-      if (scope === 'nearby' && !cell) return send(ws, { t: 'none' });
-      const mood = typeof m.mood === 'string' ? m.mood.slice(0, 16) : null;
-      const key = scope + '|' + cell;
-      const q = queues.get(key) || new Set();
-      for (const other of q) {
-        if (other.id === ws.id || isBlocked(ws.id, other.id) || isBlocked(other.id, ws.id)) continue;
-        if (!other.mood || !mood || other.mood === mood) {
+      ws.mood = typeof m.mood === 'string' ? m.mood.slice(0, 16) : null;
+      ws.homeKey = cellCenter(m.home) ? String(m.home) : null;
+      ws.home = ws.homeKey ? cellCenter(ws.homeKey) : null;
+      ws.area = m.scope === 'nearby' ? parseArea(m.area) : null;
+      if (m.scope === 'nearby' && !ws.area) return send(ws, { t: 'none' });
+      for (const other of waiting) {
+        if (compatible(ws, other)) {
           dequeue(other);
           ws.peer = other; other.peer = ws;
-          const shared = mood || other.mood || null;
+          const shared = ws.mood || other.mood || null;
           send(other, { t: 'match', role: 'offer', mood: shared, ice, relay });
           send(ws, { t: 'match', role: 'answer', mood: shared, ice, relay });
           return;
         }
       }
-      ws.mood = mood; ws.key = key; q.add(ws); queues.set(key, q);
+      ws.waiting = true; waiting.add(ws);
       ws.timer = setTimeout(() => { dequeue(ws); send(ws, { t: 'none' }); }, 60000);
     } else if (m.t === 'signal' && ws.peer) {
       send(ws.peer, { t: 'signal', d: m.d });
@@ -165,10 +205,9 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
 });
 
+setInterval(() => { wss.clients.forEach((ws) => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
+setInterval(sendHeat, 5000);
 setInterval(() => {
-  wss.clients.forEach((ws) => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); });
-}, 30000);
-setInterval(() => { // forget everything that expired
   const t = Date.now();
   for (const [k, v] of bans) if (v < t) bans.delete(k);
   for (const [k, v] of banCount) if (v.exp < t) banCount.delete(k);
